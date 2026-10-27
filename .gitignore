@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Editor and local settings
+.idea/
+.vscode/
+.codex/
+.agents/
+.env
+.env.*
+
+# Personal media and local data
+*.mp4
+*.mkv
+*.avi
+*.mov
+*.webm
+*.m4v
+history.json
+
+# Machine-specific launcher
+Lingua Cinema.desktop
+
+# Distribution archives
+dist/
