@@ -11,6 +11,7 @@ gi.require_version('Gtk', '3.0')
 gi.require_version('Gst', '1.0')
 from gi.repository import Gtk, Gst, GLib, Gdk
 from subtitles import parse, read, align, timestamp
+from audio_tracks import track_label, preferred_track, language_code
 
 Gst.init(None)
 
@@ -46,7 +47,10 @@ class Player(Gtk.Window):
         self.rate = 1.0
         self.current = -1
         self.subtitle_offset = 0.0
-        self.track_indices = []
+        self.audio_signature = None
+        self.updating_audio = False
+        self.saved_audio = None
+        self.manual_audio = False
         self.state_path = Path(os.environ.get('XDG_STATE_HOME', Path.home() / '.local/state')) / 'lingua-cinema/history.json'
         try:
             self.history = json.loads(self.state_path.read_text())
@@ -107,10 +111,17 @@ class Player(Gtk.Window):
         volume.connect('value-changed', lambda _, value: self.pipeline.set_property('volume', value))
         controls.pack_start(volume, False, False, 0)
         left.pack_start(controls, False, False, 0)
+        left.pack_start(Gtk.Label(label='Язык озвучки / звуковая дорожка', xalign=0), False, False, 0)
         self.audio = Gtk.ComboBoxText()
+        self.audio.set_sensitive(False)
         self.audio.set_tooltip_text('Выберите английскую звуковую дорожку')
         self.audio.connect('changed', self.audio_changed)
         left.pack_start(self.audio, False, False, 0)
+        self.audio_hint = Gtk.Label(label='Откройте фильм, чтобы увидеть доступные дорожки.', xalign=0)
+        self.audio_hint.set_line_wrap(True)
+        self.audio_hint.set_max_width_chars(75)
+        self.audio_hint.get_style_context().add_class('muted')
+        left.pack_start(self.audio_hint, False, False, 0)
         right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         right.set_size_request(330, -1)
         right.set_border_width(12)
@@ -184,7 +195,12 @@ class Player(Gtk.Window):
         self.path = path.resolve()
         self.english, self.russian = [], []
         self.audio.remove_all()
+        self.audio.set_sensitive(False)
+        self.audio_signature = None
+        self.manual_audio = False
+        self.audio_hint.set_text('Ищу звуковые дорожки…')
         saved = self.history.get(str(self.path), {})
+        self.saved_audio = saved.get('audio_track')
         self.resume = saved.get('position', 0)
         self.offset.set_value(saved.get('offset', 0))
         self.rate = 1.0
@@ -245,15 +261,7 @@ class Player(Gtk.Window):
                 setattr(self, 'english' if lang == 'en' else 'russian', cues)
                 if source:
                     self.history.setdefault(str(self.path), {})[lang] = source
-        english_track = -1
-        for i, stream in enumerate(s for s in streams if s.get('codec_type') == 'audio'):
-            tags = stream.get('tags', {})
-            language = tags.get('language', 'язык не указан')
-            self.audio.append_text(f'Звук {i + 1}: {language} · {tags.get("title", stream.get("codec_name", ""))}')
-            if language in ('en', 'eng'):
-                english_track = i
-        if self.audio.get_model() and len(self.audio.get_model()):
-            self.audio.set_active(english_track if english_track >= 0 else 0)
+        self.refresh_audio()
         self.rebuild()
         self.subtitle_status()
         return False
@@ -347,9 +355,51 @@ class Player(Gtk.Window):
     def offset_changed(self, spin):
         self.subtitle_offset = spin.get_value()
 
+    def refresh_audio(self):
+        # Use the player's own indices, not ffprobe stream ordering. This also
+        # works while subtitle extraction is running or ffprobe is unavailable.
+        count = self.pipeline.get_property('n-audio')
+        tracks = []
+        for index in range(count):
+            tags = self.pipeline.emit('get-audio-tags', index)
+            values = []
+            for key in ('language-code', 'title', 'audio-codec'):
+                ok, value = tags.get_string(key) if tags else (False, '')
+                values.append(value if ok else '')
+            tracks.append(tuple(values))
+        signature = tuple(tracks)
+        if signature == self.audio_signature:
+            return
+        self.audio_signature = signature
+        current = self.pipeline.get_property('current-audio')
+        chosen = current if self.manual_audio else preferred_track(tracks, self.saved_audio, current)
+        self.updating_audio = True
+        self.audio.remove_all()
+        for index, metadata in enumerate(tracks):
+            self.audio.append_text(track_label(index, *metadata))
+        self.audio.set_sensitive(count > 1)
+        if count:
+            self.audio.set_active(chosen)
+            if current != chosen:
+                self.pipeline.set_property('current-audio', chosen)
+        self.updating_audio = False
+        if not count:
+            self.audio_hint.set_text('Звуковые дорожки пока не обнаружены.')
+        elif count == 1:
+            self.audio_hint.set_text('Доступна только одна звуковая дорожка. Другую озвучку в этом файле выбрать нельзя.')
+        elif any(language_code(t[0]) in ('', 'und') for t in tracks):
+            self.audio_hint.set_text(f'Доступно дорожек: {count}. У некоторых язык не подписан — переключите и послушайте.')
+        else:
+            self.audio_hint.set_text(f'Доступно дорожек: {count}. Выберите нужный язык в списке выше.')
+
     def audio_changed(self, combo):
-        if combo.get_active() >= 0:
-            self.pipeline.set_property('current-audio', combo.get_active())
+        index = combo.get_active()
+        if self.updating_audio or index < 0 or not self.path:
+            return
+        self.manual_audio = True
+        self.pipeline.set_property('current-audio', index)
+        self.saved_audio = index
+        self.history.setdefault(str(self.path), {})['audio_track'] = index
 
     def begin_drag(self, *_):
         self.dragging = True
@@ -367,6 +417,7 @@ class Player(Gtk.Window):
 
     def tick(self):
         if self.path:
+            self.refresh_audio()
             ok, duration = self.pipeline.query_duration(Gst.Format.TIME)
             if ok and duration > 0:
                 self.duration = duration / Gst.SECOND
